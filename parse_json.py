@@ -20,8 +20,9 @@
 
 import json
 import argparse
+import re
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from jsonschema import validate, ValidationError
 
@@ -33,6 +34,59 @@ LEVEL_COLOR_PALETTES = [
 ]
 
 VALUE_COLORS = ("#e4e4e4", "#f4f4f4")
+
+ACRONYMS = {
+    "ip":  "IP",
+    "hw": "HW",
+    "sw":  "SW",
+    "isa": "ISA",
+    "trl": "TRL",
+    "api": "API",
+    "cli": "CLI",
+    "soc": "SoC",
+    "url": "URL",
+    "uri": "URI",
+    "sdk": "SDK",
+    "hal": "HAL",
+    "dsl": "DSL",
+    "ppa": "PPA",
+    "fpga": "FPGA",
+    "asic": "ASIC",
+    "rdl": "RDL",
+    "xact": "XACT",
+    "iommu": "IOMMU",
+    "os": "OS",
+    "cpu": "CPU",
+    "gpu": "GPU",
+    "dma": "DMA",
+    "mmio": "MMIO",
+    "axil": "AXIL",
+    "axi": "AXI",
+    "apb": "APB",
+    "ahb": "AHB",
+    "noc": "NOC",
+    "tlb": "TLB",
+    "irq": "IRQ",
+    "uvm": "UVM",
+    "rtl": "RTL",
+    "gds": "GDS",
+    "pdk": "PDK",
+    "sram": "SRAM",
+    "ddr": "DDR",
+    "hbm": "HBM",
+    "rom": "ROM",
+    "ram": "RAM",
+    "json": "JSON",
+    "jsonc": "JSONC",
+    "csv": "CSV",
+    "xml": "XML",
+    "yaml": "YAML",
+    "elf": "ELF",
+    "ods": "ODS",
+    "latex": "LaTeX",
+    "v": "V",
+}
+
 
 def strip_jsonc_comments(text: str) -> str:
     """Strip // and /* */ comments from JSONC while preserving strings."""
@@ -102,6 +156,17 @@ def strip_jsonc_comments(text: str) -> str:
     return '\n'.join(result)
 
 
+def load_json_or_jsonc(path: str) -> Any:
+    raw = Path(path).read_text(encoding="utf-8")
+    return json.loads(strip_jsonc_comments(raw))
+
+
+def normalize_abbreviations_in_text(text: str) -> str:
+    for lower, upper in sorted(ACRONYMS.items(), key=lambda kv: -len(kv[0])):
+        text = re.sub(rf"\b{re.escape(lower)}\b", upper, text, flags=re.IGNORECASE)
+    return text
+
+
 def flatten_fields(data: Any, path: Optional[Sequence[str]] = None) -> List[Tuple[List[str], Any]]:
     """Return ([path segments], value) entries for each leaf node."""
     if path is None:
@@ -137,7 +202,8 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
     doc.styles.addElement(header_style)
 
     flattened_entries = list(flattened)
-    max_depth = max((len(parts) for parts, _ in flattened_entries), default=0)
+    visible_entries = [([segment for segment in parts if not segment.startswith("[")], value) for parts, value in flattened_entries]
+    max_depth = max((len(parts) for parts, _ in visible_entries), default=0)
 
     def chars_to_cm(char_count: int) -> float:
         # rough conversion to keep columns readable while not overly wide
@@ -146,11 +212,12 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
     column_widths = [0] * max_depth
     value_column_width = 0
 
-    for parts, value in flattened_entries:
+    for visible_parts, value in visible_entries:
         for idx in range(max_depth):
-            segment = parts[idx] if idx < len(parts) else ""
-            column_widths[idx] = max(column_widths[idx], len(segment))
-        value_text = "" if value is None else str(value)
+            segment = visible_parts[idx] if idx < len(visible_parts) else ""
+            display_segment = format_field_name(segment) if segment else segment
+            column_widths[idx] = max(column_widths[idx], len(display_segment))
+        value_text = "" if value is None else format_value(value)
         value_column_width = max(value_column_width, len(value_text))
 
     table = Table(name="IP Card")
@@ -220,10 +287,11 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
             value_cell_styles[color_index] = style
         return style
 
-    for parts, value in flattened_entries:
+    for visible_parts, value in visible_entries:
         row = TableRow()
         for depth in range(max_depth):
-            segment = parts[depth] if depth < len(parts) else ""
+            segment = visible_parts[depth] if depth < len(visible_parts) else ""
+            display_segment = format_field_name(segment) if segment else segment
             cell_kwargs = {"valuetype": "string"}
             if segment and depth < shaded_levels:
                 state = level_states[depth]
@@ -237,10 +305,10 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
                 level_states[depth]["prev"] = None
 
             cell = TableCell(**cell_kwargs)
-            cell.addElement(P(text=segment))
+            cell.addElement(P(text=display_segment))
             row.addElement(cell)
 
-        value_text = "" if value is None else str(value)
+        value_text = "" if value is None else format_value(value)
         value_kwargs = {"valuetype": "string"}
         if value_text:
             if value_state["prev_nonempty"]:
@@ -251,6 +319,7 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
             value_kwargs["stylename"] = get_value_cell_style(value_state["index"])
         else:
             value_state["prev_nonempty"] = False
+
         value_cell = TableCell(**value_kwargs)
         value_cell.addElement(P(text=value_text))
         row.addElement(value_cell)
@@ -262,73 +331,156 @@ def export_to_ods(flattened: Iterable[Tuple[List[str], Any]], output_path: str) 
     doc.save(str(out_path), addsuffix=not out_path.suffix)
 
 
-def export_to_latex(data: dict, output_path: str) -> None:
-    """Export IP card data to LaTeX table format."""
-    
-    def escape_latex(text: str) -> str:
-        """Escape special LaTeX characters."""
-        if text is None:
-            return ""
-        text = str(text)
-        replacements = {
-            '\\': r'\textbackslash{}',  # Must be first to avoid double-escaping
-            '&': r'\&',
-            '%': r'\%',
-            '$': r'\$',
-            '#': r'\#',
-            '_': r'\_',
-            '{': r'\{',
-            '}': r'\}',
-            '~': r'$\sim$',
-            '<': r'$<$',
-            '>': r'$>$',
-            '^': r'\textasciicircum{}',
-        }
-        for old, new in replacements.items():
-            text = text.replace(old, new)
-        return text
-    
-    def format_field_name(key: str) -> str:
-        """Convert camelCase field names to human-readable format."""
-        import re
-        # Insert space before capitals
-        result = re.sub(r'([a-z])([A-Z])', r'\1 \2', key)
-        # Capitalize first letter
-        result = result[0].upper() + result[1:] if result else result
-        return result
-    
-    def process_dict_to_rows(d: dict, section_name: str = None) -> List[Tuple[str, str, str]]:
-        """Convert a dictionary to table rows. Returns list of (field, subfield, value) tuples."""
-        rows = []
-        
-        for key, value in d.items():
-            field_name = format_field_name(key)
-            
-            if isinstance(value, dict):
-                # Nested dictionary - field name becomes a multirow parent
-                subrows = []
-                for subkey, subvalue in value.items():
-                    subfield_name = format_field_name(subkey)
-                    subvalue_str = str(subvalue) if subvalue is not None else ""
-                    subrows.append((field_name, subfield_name, subvalue_str))
-                
-                # First subrow includes the parent field name with multirow
-                if subrows:
-                    rows.extend(subrows)
+def escape_latex(text: Any) -> str:
+    """Escape special LaTeX characters."""
+    if text is None:
+        return ""
+    text = str(text)
+
+    replacements = {
+        "\\": r"\textbackslash{}",  # Must be first to avoid double-escaping.
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "<": r"$<$",
+        ">": r"$>$",
+        "^": r"\textasciicircum{}",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def format_field_name(key: str) -> str:
+    """Convert camelCase / PascalCase field names to human-readable labels,
+    preserving known acronyms (IP, ISA, SW, TRL, …)."""
+    special_cases = {
+        "ipXact": "IP-XACT",
+        "targetFpgaOrAsic": "Target FPGA or ASIC",
+        "highLevelApi": "highLevelAPI",
+        "isaExtension": "ISAExtension",
+        "organizationURL": "Organization URL",
+        "repositoryURL": "Repository URL",
+    }
+    if key in special_cases:
+        return special_cases[key]
+
+    import re
+
+    # Split leading acronym from the rest: SWDependencies → SW | Dependencies
+    key = re.sub(r'^([A-Z]{2,})([A-Z][a-z])', r'\1 \2', key)
+
+    parts = re.findall(r'[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+', key)
+
+    words = []
+    for part in parts:
+        lower = part.lower()
+        if lower in ACRONYMS:
+            words.append(ACRONYMS[lower])
+        else:
+            words.append(part.capitalize())
+
+    return " ".join(words)
+
+
+def is_scalar(value: Any) -> bool:
+    """Return True for values that can be rendered directly in a single cell."""
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def format_value(value: Any) -> str:
+    """Convert arbitrary JSON values to a readable string for LaTeX export."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        if all(is_scalar(item) for item in value):
+            return ", ".join(str(item) for item in value)
+        return "; ".join(format_value(item) for item in value)
+    if isinstance(value, dict):
+        return ", ".join(f"{format_field_name(str(k))}: {format_value(v)}" for k, v in value.items())
+    return str(value)
+
+
+def process_dict_to_rows(d: Dict[str, Any], section_name: str = None) -> List[Tuple[str, str, str]]:
+    """Convert a dictionary to table rows returning (field, subfield, value) tuples."""
+    rows: List[Tuple[str, str, str]] = []
+
+    for key, value in d.items():
+        field_name = format_field_name(str(key))
+
+        if isinstance(value, dict):
+            subrows = []
+            for subkey, subvalue in value.items():
+                subfield_name = format_field_name(str(subkey))
+                subrows.append((field_name, subfield_name, format_value(subvalue)))
+            if subrows:
+                rows.extend(subrows)
             else:
-                # Simple key-value pair
-                value_str = str(value) if value is not None else ""
-                rows.append((field_name, "", value_str))
-        
-        return rows
-    
-    latex_lines = []
-    
-    # Header comments
+                rows.append((field_name, "", ""))
+        elif isinstance(value, list):
+            if not value:
+                rows.append((field_name, "", ""))
+            elif all(is_scalar(item) for item in value):
+                rows.append((field_name, "", ", ".join(str(item) for item in value)))
+            elif all(isinstance(item, dict) for item in value):
+                for item in value:
+                    for subkey, subvalue in item.items():
+                        subfield_name = format_field_name(str(subkey))
+                        rows.append((field_name, subfield_name, format_value(subvalue)))
+            else:
+                for item in value:
+                    rows.append((field_name, "", format_value(item)))
+        else:
+            rows.append((field_name, "", format_value(value)))
+
+    return rows
+
+
+def get_section_order(data: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Return section ordering: preferred known sections first, then any extras."""
+    preferred_sections = [
+        ("schemaVersion", "Schema Version"),
+        ("basicInfo", "Basic Info"),
+        ("systemLevelFeatures", "System-Level Features"),
+        ("systemLevelInfo", "System-Level Info"),
+        ("architecture", "Architecture"),
+        ("microarchitecture", "Microarchitecture"),
+        ("interfaces", "Interfaces"),
+        ("software", "Software"),
+        ("integration", "Integration"),
+        ("deployment", "Deployment"),
+        ("physicalImplementation", "Physical Implementation"),
+    ]
+
+    ordered: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    for key, title in preferred_sections:
+        if key in data:
+            ordered.append((key, title))
+            seen.add(key)
+
+    for key in data.keys():
+        if key not in seen:
+            ordered.append((str(key), format_field_name(str(key))))
+
+    return ordered
+
+
+def export_to_latex(data: Dict[str, Any], output_path: str) -> None:
+    """Export IP card data to LaTeX table format."""
+    latex_lines: List[str] = []
+
     latex_lines.append("% Please add the following required packages to your document preamble:")
     latex_lines.append("% \\usepackage{booktabs}")
     latex_lines.append("% \\usepackage{multirow}")
     latex_lines.append("% \\usepackage{longtable}")
+    latex_lines.append("% Optional for better URL wrapping: \\usepackage{xurl} and \\usepackage{hyperref}")
     latex_lines.append("% Note: It may be necessary to compile the document several times to get a multi-page table to line up properly")
     latex_lines.append("")
     latex_lines.append("\\begin{table}[h!]")
@@ -336,38 +488,30 @@ def export_to_latex(data: dict, output_path: str) -> None:
     latex_lines.append("% \\resizebox{\\textwidth}{!}{%")
     latex_lines.append("\\centering")
     latex_lines.append("\\scalebox{0.5558}{%")
-    latex_lines.append("\\begin{tabular}{@{}lll@{}}")
+    latex_lines.append("\\begin{tabular}{@{}llp{0.65\\textwidth}@{}}")
     latex_lines.append("\\toprule")
-    
-    # Process each major section
-    section_order = [
-        ("basicInfo", "Basic Info"),
-        ("systemLevelFeatures", "System-Level Features"),
-        ("architecture", "Architecture"),
-        ("microarchitecture", "Microarchitecture"),
-        ("software", "Software"),
-        ("integration", "Integration"),
-        ("physicalImplementation", "Physical Implementation"),
-    ]
-    
-    for section_key, section_title in section_order:
+
+    section_order = get_section_order(data)
+
+    for section_index, (section_key, section_title) in enumerate(section_order):
         if section_key not in data:
             continue
-            
+
         section_data = data[section_key]
-        
-        # Section header
-        latex_lines.append(f"\\multicolumn{{3}}{{c}}{{\\textbf{{{escape_latex(section_title)}}}}} \\\\ \\toprule")
-        
-        # Process section content
-        rows = process_dict_to_rows(section_data, section_title)
-        
-        # Group rows by field name for multirow handling
+
+        latex_lines.append(
+            f"\\multicolumn{{3}}{{c}}{{\\textbf{{{escape_latex(section_title)}}}}} \\\\ \\toprule"
+        )
+
+        if isinstance(section_data, dict):
+            rows = process_dict_to_rows(section_data, section_title)
+        else:
+            rows = [(format_field_name(str(section_key)), "", format_value(section_data))]
+
         current_field = None
-        field_rows = []
-        all_field_groups = []
-        
-        # First, group all rows by field
+        field_rows: List[Tuple[str, str]] = []
+        all_field_groups: List[Tuple[str, List[Tuple[str, str]]]] = []
+
         for field, subfield, value in rows:
             if field != current_field:
                 if field_rows:
@@ -375,110 +519,156 @@ def export_to_latex(data: dict, output_path: str) -> None:
                 current_field = field
                 field_rows = []
             field_rows.append((subfield, value))
-        
-        # Don't forget the last group
+
         if field_rows:
             all_field_groups.append((current_field, field_rows))
-        
-        # Now output all field groups with proper midrule placement
+
         for idx, (field_name, field_data) in enumerate(all_field_groups):
             if len(field_data) > 1:
-                # Use multirow for the field name
-                latex_lines.append(f"\\multirow{{{len(field_data)}}}{{*}}{{\\textit{{{escape_latex(field_name)}}}}} & {escape_latex(field_data[0][0])} & {escape_latex(field_data[0][1])} \\\\")
-                for subf, val in field_data[1:]:
-                    latex_lines.append(f" & {escape_latex(subf)} & {escape_latex(val)} \\\\")
+                latex_lines.append(
+                    f"\\multirow{{{len(field_data)}}}{{*}}{{\\textit{{{escape_latex(field_name)}}}}} & "
+                    f"{escape_latex(field_data[0][0])} & {escape_latex(field_data[0][1])} \\\\"
+                )
+                for subfield_name, value_text in field_data[1:]:
+                    latex_lines.append(
+                        f" & {escape_latex(subfield_name)} & {escape_latex(value_text)} \\\\"
+                    )
             else:
-                # Single row
-                if field_data[0][0]:  # Has subfield
-                    latex_lines.append(f"\\multirow{{1}}{{*}}{{\\textit{{{escape_latex(field_name)}}}}} & {escape_latex(field_data[0][0])} & {escape_latex(field_data[0][1])} \\\\")
-                else:  # No subfield, just field and value
-                    latex_lines.append(f"\\textit{{{escape_latex(field_name)}}} & {escape_latex(field_data[0][1])} &  \\\\")
-            
-            # Add midrule after each field group except the last one in the section
+                subfield_name, value_text = field_data[0]
+                if subfield_name:
+                    latex_lines.append(
+                        f"\\multirow{{1}}{{*}}{{\\textit{{{escape_latex(field_name)}}}}} & "
+                        f"{escape_latex(subfield_name)} & {escape_latex(value_text)} \\\\"
+                    )
+                else:
+                    latex_lines.append(
+                        f"\\textit{{{escape_latex(field_name)}}} &  & {escape_latex(value_text)} \\\\"
+                    )
+
             if idx < len(all_field_groups) - 1:
                 latex_lines.append("\\midrule")
-        
-        # Add toprule after each section (except the last one)
-        if section_key != section_order[-1][0]:
-            # Check if there are more sections to come
-            remaining_sections = section_order[section_order.index((section_key, section_title)) + 1:]
-            if any(s[0] in data for s in remaining_sections):
-                latex_lines.append("\\toprule")
-    
-    # Footer
+
+        if section_index < len(section_order) - 1:
+            latex_lines.append("\\toprule")
+
     latex_lines.append("\\bottomrule")
     latex_lines.append("\\end{tabular}%")
     latex_lines.append("}")
     latex_lines.append("\\end{table}")
-    
-    # Write to file
+
     out_path = Path(output_path)
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(latex_lines))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(latex_lines))
 
 
-def main(schema: str = "schema.jsonschema", ip: str = None, export_ods: Optional[str] = None, export_latex: Optional[str] = None):
+def validate_against_schema(data: Any, schema: Dict[str, Any]) -> None:
+    """Validate a JSON object or a list of JSON objects against the schema."""
+    if isinstance(data, list):
+        for idx, item in enumerate(data, start=1):
+            try:
+                validate(instance=item, schema=schema)
+            except ValidationError as exc:
+                raise ValidationError(f"Item {idx}: {exc.message}") from exc
+    else:
+        validate(instance=data, schema=schema)
+
+
+def uppercase_schema_acronyms(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"title", "description", "$comment"} and isinstance(item, str):
+                result[key] = normalize_abbreviations_in_text(item)
+            else:
+                result[key] = uppercase_schema_acronyms(item)
+        return result
+    if isinstance(value, list):
+        return [uppercase_schema_acronyms(item) for item in value]
+    if isinstance(value, str):
+        return normalize_abbreviations_in_text(value)
+    return value
+
+
+def write_json(path: str, data: Any) -> None:
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def main(
+    schema: str = "schema.jsonschema",
+    ip: str = None,
+    export_ods: Optional[str] = None,
+    export_latex: Optional[str] = None,
+    normalize_schema: Optional[str] = None,
+) -> int:
+    try:
+        schema_data = load_json_or_jsonc(schema)
+    except FileNotFoundError:
+        print(f"Schema file not found: {schema}")
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON in schema file: {exc}")
+        return 1
+
+    if normalize_schema:
+        normalized = uppercase_schema_acronyms(schema_data)
+        write_json(normalize_schema, normalized)
+        print(f"Normalized schema written to {normalize_schema}")
+
     if ip is None:
         raise ValueError("IP argument is required")
-    
-    # Load schema
-    try:
-        with open(schema, "r", encoding="utf-8") as f:
-            schema_data = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ Schema file not found: {schema}")
-        return
-    except json.JSONDecodeError as e:
-        print(f"❌ Invalid JSON in schema file: {e}")
-        return
 
-    # Load IP json
     try:
         with open(ip, "r", encoding="utf-8") as f:
             raw = f.read()
     except FileNotFoundError:
-        print(f"❌ IP file not found: {ip}")
-        return
-    
+        print(f"IP file not found: {ip}")
+        return 1
+
     nocomments = strip_jsonc_comments(raw)
-    
+
     try:
         data = json.loads(nocomments)
     except json.JSONDecodeError as e:
-        print(f"❌ Invalid JSON after comment removal: {e}")
+        print(f"Invalid JSON after comment removal: {e}")
         print(f"Error at line {e.lineno}, column {e.colno}")
-        # Show the problematic area
-        lines = nocomments.split('\n')
+        lines = nocomments.split("\n")
         start_line = max(0, e.lineno - 3)
         end_line = min(len(lines), e.lineno + 2)
         print("Context around error:")
         for i in range(start_line, end_line):
             marker = ">>> " if i == e.lineno - 1 else "    "
-            print(f"{marker}{i+1:3d}: {lines[i]}")
-        return
+            print(f"{marker}{i + 1:3d}: {lines[i]}")
+        return 1
 
     try:
-        validate(instance=data, schema=schema_data)
-        print("✅ JSON is schema-compliant")
-    except ValidationError as e:
-        print("❌ JSON is NOT compliant")
-        print("Path:", list(e.path))      # where in the JSON the error occurred
-        print("Message:", e.message)      # human-readable error
-        return
+        validate_against_schema(data, schema_data)
+        print("JSON is schema-compliant")
+    except ValidationError as exc:
+        print("JSON is NOT compliant")
+        print("Path:", list(exc.path))
+        print("Message:", exc.message)
+        return 1
 
     if export_ods:
         try:
             export_to_ods(flatten_fields(data), export_ods)
-            print(f"📝 Exported IP card to {export_ods}")
+            print(f"Exported IP card to {export_ods}")
         except RuntimeError as exc:
-            print(f"❌ Failed to export to ODS: {exc}")
-    
+            print(f"Failed to export to ODS: {exc}")
+            return 1
+
     if export_latex:
         try:
-            export_to_latex(data, export_latex)
-            print(f"📝 Exported IP card to LaTeX: {export_latex}")
+            latex_data = data
+            if isinstance(data, list):
+                latex_data = {f"Item {i}": item for i, item in enumerate(data, start=1)}
+            export_to_latex(latex_data, export_latex)
+            print(f"Exported IP card to LaTeX: {export_latex}")
         except Exception as exc:
-            print(f"❌ Failed to export to LaTeX: {exc}")
+            print(f"Failed to export to LaTeX: {exc}")
+            return 1
+
+    return 0
 
 
 if __name__ == "__main__":
@@ -486,11 +676,21 @@ if __name__ == "__main__":
     parser.add_argument("--schema", default="schema.jsonschema", type=str, 
                        help="Path to the JSON schema file")
     parser.add_argument("--ip", type=str, required=True,
-                       help="Path to the IP JSON file to validate")
+                       help="Path to the IP JSON/JSONC file to validate")
     parser.add_argument("--export-ods", type=str,
                        help="Path to export a flattened, human-readable ODS spreadsheet")
     parser.add_argument("--export-latex", type=str,
                        help="Path to export a LaTeX table file")
+    parser.add_argument("--normalize-schema", type=str,
+                       help="Write a copy of the schema with schema acronyms normalized to uppercase")
     
     args = parser.parse_args()
-    main(schema=args.schema, ip=args.ip, export_ods=args.export_ods, export_latex=args.export_latex)
+    raise SystemExit(
+        main(
+            schema=args.schema,
+            ip=args.ip,
+            export_ods=args.export_ods,
+            export_latex=args.export_latex,
+            normalize_schema=args.normalize_schema,
+        )
+    )
